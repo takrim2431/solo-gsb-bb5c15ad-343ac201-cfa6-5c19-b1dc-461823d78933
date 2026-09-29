@@ -334,8 +334,12 @@ def _resolution_items(body: ResolveRequest | DraftUpdateRequest) -> list[dict]:
 def resolve_merge(merge_id: str, body: ResolveRequest):
     """Submit a batch of conflict resolutions against the current revision.
 
-    Returns 409 on a stale revision or once the merge is resolved.
-    When the last conflict is resolved the result becomes immutable.
+    Every item must give exactly one of ``choice`` (``"left"`` /
+    ``"right"``) or an explicit ``value`` (an explicit null counts as
+    given); an item giving both or neither rejects the whole batch with
+    400 and writes nothing, exactly like the dry-run. Returns 409 on a
+    stale revision or once the merge is resolved. When the last conflict
+    is resolved the result becomes immutable.
     """
     return store.apply_resolutions(merge_id, body.revision, _resolution_items(body))
 

@@ -262,6 +262,117 @@ def test_resolution_preview_rejects_invalid_batch(client):
     assert fetched["status"] == "pending"
 
 
+def test_commit_rejects_item_mixing_or_missing_choice_and_value(client):
+    # Two open conflicts so a legal item can precede the malformed one.
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1, "b": 1},
+            "left": {"a": 2, "b": 2},
+            "right": {"a": 3, "b": 3},
+        },
+    )
+    mid = resp.json()["merge_id"]
+
+    def rejected(payload, snippet):
+        resp = client.post(f"/merges/{mid}/resolutions", json=payload)
+        assert resp.status_code == 400, resp.text
+        assert snippet in resp.json()["detail"]
+        # The whole batch is rejected: earlier legal items are not
+        # written either; document, conflicts, result and revision stay
+        # exactly as created.
+        fetched = client.get(f"/merges/{mid}").json()
+        assert fetched["revision"] == 1
+        assert fetched["status"] == "pending"
+        assert sorted(c["pointer"] for c in fetched["conflicts"]) == ["/a", "/b"]
+        assert fetched["document"] == {
+            "a": {"__merge_conflict__": "/a"},
+            "b": {"__merge_conflict__": "/b"},
+        }
+        assert fetched["result"] is None
+
+    # Both choice and value on one item -> 400, even after a legal item.
+    rejected(
+        {
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "choice": "left"},
+                {"pointer": "/b", "choice": "right", "value": "x"},
+            ],
+        },
+        "both 'choice' and 'value'",
+    )
+
+    # An explicit null value still counts as giving 'value'.
+    rejected(
+        {
+            "revision": 1,
+            "resolutions": [{"pointer": "/a", "choice": "left", "value": None}],
+        },
+        "both 'choice' and 'value'",
+    )
+
+    # Neither choice nor value -> 400, again with a legal item first.
+    rejected(
+        {
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "choice": "left"},
+                {"pointer": "/b"},
+            ],
+        },
+        "needs 'choice' or 'value'",
+    )
+
+    # Rejected batches leave no audit event, and the same revision can be
+    # used afterwards with a well-formed batch.
+    assert client.get(f"/merges/{mid}/audit").json()["events"] == []
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "choice": "left"},
+                {"pointer": "/b", "value": None},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == {"a": 2, "b": None}
+
+
+def test_preview_and_commit_judge_choice_value_consistently(client):
+    merge = create_merge(client)
+    mid = merge["merge_id"]
+
+    bad_bodies = [
+        # Both choice and value.
+        {
+            "revision": 1,
+            "resolutions": [{"pointer": "/db/host", "choice": "left", "value": "x"}],
+        },
+        # Both choice and an explicit null value.
+        {
+            "revision": 1,
+            "resolutions": [{"pointer": "/db/host", "choice": "left", "value": None}],
+        },
+        # Neither choice nor value.
+        {"revision": 1, "resolutions": [{"pointer": "/db/host"}]},
+    ]
+    for body in bad_bodies:
+        preview = client.post(f"/merges/{mid}/resolution-preview", json=body)
+        commit = client.post(f"/merges/{mid}/resolutions", json=body)
+        assert preview.status_code == 400
+        assert commit.status_code == 400
+        assert preview.json()["detail"] == commit.json()["detail"]
+
+    # Nothing was committed by any of the rejected attempts.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+    assert [c["pointer"] for c in fetched["conflicts"]] == ["/db/host"]
+
+
 def test_resolution_preview_revision_and_state_guards(client):
     merge = create_merge(client)
     mid = merge["merge_id"]

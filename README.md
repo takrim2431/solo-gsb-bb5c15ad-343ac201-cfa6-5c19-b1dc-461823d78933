@@ -182,7 +182,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023
 
 ### 3. 分批解决冲突 — `POST /merges/{merge_id}/resolutions`
 
-每条取值二选一：`choice`（采用某侧候选，`"left"` / `"right"`；若该侧为删除侧则删除该键）或 `value`（显式取值，可为 `null`）。可一次提交多条（批量），也可分多批提交。
+每条取值二选一：`choice`（采用某侧候选，`"left"` / `"right"`；若该侧为删除侧则删除该键）或 `value`（显式取值，可为 `null`；显式给出 `"value": null` 也算给出了 `value`）。可一次提交多条（批量），也可分多批提交。
 
 ```bash
 curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/resolutions \
@@ -195,10 +195,50 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
   }'
 ```
 
+显式取值（含 `null`）的写法：
+
+```bash
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/resolutions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "revision": 1,
+    "resolutions": [
+      {"pointer": "/db/host", "value": null}
+    ]
+  }'
+```
+
+- **每条裁决必须恰好给出 `choice` 或 `value` 之一**：同一条目**两者都给**（混用，包括 `choice` 与 `"value": null` 同时出现）或**两者都不给**（既无 `choice` 也无 `value` 字段）→ 整批 **`400`**。服务在应用任何一条之前先校验整批形状，因此**即使批次前面的条目完全合法也不会写入**：`document`、`conflicts`、`result`、`revision` 与审计事件均保持原样，可用同一 `revision` 修正后重试。此判定与预演接口（`resolution-preview`）及草案编辑**完全一致**——相同请求体在三处得到相同结论（预演本来就拒绝混用；正式提交历史上会静默采用 `choice` 落库，现已对齐为同样拒绝）。
+
+混用（同时给出 `choice` 和 `value`）的请求：
+
+```bash
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/resolutions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "revision": 1,
+    "resolutions": [
+      {"pointer": "/db/host", "choice": "left", "value": "b"}
+    ]
+  }'
+```
+
+响应 **`400`**（整批不写入，无审计事件）：
+
+```json
+{"detail": "resolution for '/db/host' gives both 'choice' and 'value'"}
+```
+
+两者皆无的请求同样 **`400`**：
+
+```json
+{"detail": "resolution for '/db/host' needs 'choice' or 'value'"}
+```
+
 - **revision 过期 → `409`**：请求中的 `revision` 必须与当前一致（创建时为 1，每接受一批 +1）。过期时响应体携带 `current_revision`，客户端重新拉取状态后重试。
 - **`result_schema` 门禁**：仅当本批将解决**最后一个**冲突（产生最终结果）时，才用创建合并单时携带的 schema 校验候选结果；**部分解决**的批次仍留着占位符文档，不做校验。最终批次校验失败 → **`422`**，响应体按 `instance_path`、`schema_path` 稳定排序列出全部违规（每条含 `instance_path`、`schema_path`、`message`），**整批不写入、revision 不变、冲突列表保持原样**，可修正取值后用原 revision 重试。
 - 全部冲突解决后 `status` 变为 `resolved`，`result` 生成且**不可变**；此后再提交取值一律返回 `409`。
-- 对不存在的冲突指针取值返回 `400`；合并单不存在返回 `404`。
+- 对不存在的冲突指针（或同一指针在一批中重复给出）取值返回 `400`；合并单不存在返回 `404`。
 
 例如 schema 要求 `/db/host` 为字符串时，最终批次若给出整数会得到：
 
@@ -253,7 +293,7 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
 
 - `would_resolve` 为 `true`（该批次可解决全部剩余冲突）时，额外返回 `base` → 预演结果的确定性 `patch`（规则同 `GET /merges/{merge_id}/patch`）与 `result_sha256`；否则不携带这两个字段。
 - **`result_schema` 门禁与正式提交一致**：仅当该批次将消除最后一个冲突（`would_resolve` 为 `true`）且合并单带有 `result_schema` 时，预演会用与正式提交完全相同的 Draft 2020-12 校验检查候选结果；违规 → 与正式提交相同的 **`422`** 错误列表（按 `instance_path`、`schema_path` 稳定排序），且**不返回成功预演结果**（无 `document` / `would_resolve` / `patch`）。仍有冲突剩余的部分预演不提前校验，照常返回部分预演结果。预演全程只读：无论通过与否，合并单的 `revision`、状态、冲突列表、草案与审计记录均不受影响。
-- 任一指针对应的冲突不存在或已在本批中被解决（即指针重复）、或同一条目同时给出 `choice` 与 `value`（显式 `null` 也算给出 `value`）→ 整批 **`400`**，同样无任何副作用。
+- 任一指针对应的冲突不存在或已在本批中被解决（即指针重复）、同一条目同时给出 `choice` 与 `value`（显式 `null` 也算给出 `value`，属混用）、或两者皆无 → 整批 **`400`**，同样无任何副作用。这批形状校验与正式提交共用同一实现：**相同的请求体在预演与正式提交中得到相同的 `400` 判定与错误信息**（混用或缺失不会再出现“预演拒绝、提交却静默采用 `choice`”的分歧）。
 - `revision` 过期、合并单已 `resolved` → 与正式提交相同的 **`409`**；合并单不存在 → **`404`**。
 
 ### 5. 规则批量裁决 — `POST /merges/{merge_id}/rule-resolutions`
@@ -794,7 +834,7 @@ pip install -r requirements.txt
 pip install httpx pytest
 export EVIDENCE_HMAC_KEY=<至少 32 字节的密钥>   # 证据包签名密钥，缺失或过短无法启动
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（246 项）
+python -m pytest tests/ -q                  # 运行测试（258 项）
 ```
 
 ## 项目结构

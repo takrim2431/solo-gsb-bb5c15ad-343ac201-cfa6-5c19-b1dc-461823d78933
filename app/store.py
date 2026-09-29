@@ -269,6 +269,27 @@ def create_merge(
     return get_merge(merge_id), True
 
 
+def _validate_resolution_item(item: dict) -> None:
+    """Ensure one resolution item gives exactly one of 'choice' / 'value'.
+
+    An explicit JSON null counts as giving 'value' (the caller sets
+    ``value_provided`` from the request's field set), so an item mixing
+    the two or giving neither is rejected. The committing endpoint, the
+    dry-run and draft edits all share this check, so identical input is
+    judged identically instead of the commit silently preferring
+    'choice' when both are present.
+    """
+    pointer = item["pointer"]
+    if item.get("choice") is not None and item.get("value_provided"):
+        raise InvalidResolution(
+            f"resolution for {pointer!r} gives both 'choice' and 'value'"
+        )
+    if item.get("choice") is None and not item.get("value_provided"):
+        raise InvalidResolution(
+            f"resolution for {pointer!r} needs 'choice' or 'value'"
+        )
+
+
 def _apply_batch(
     document: Any, conflicts: list[dict], resolutions: list[dict]
 ) -> tuple[Any, list[dict]]:
@@ -276,9 +297,14 @@ def _apply_batch(
 
     Returns (document, remaining_conflicts). Pure: the caller decides
     whether the outcome is persisted (apply_resolutions) or discarded
-    (preview_resolutions). A repeated pointer fails because the first
-    occurrence closes the conflict.
+    (preview_resolutions). Every item's choice/value shape is validated
+    for the whole batch before any conflict is closed, so a malformed
+    item rejects the batch even when earlier items are legal and no
+    caller can observe a partially applied outcome. A repeated pointer
+    fails because the first occurrence closes the conflict.
     """
+    for item in resolutions:
+        _validate_resolution_item(item)
     open_conflicts = {c["pointer"]: c for c in conflicts}
     for item in resolutions:
         pointer = item["pointer"]
@@ -294,12 +320,10 @@ def _apply_batch(
                 document = delete_at(document, tokens)
             else:
                 document = set_at(document, tokens, conflict[side])
-        elif item.get("value_provided"):
-            document = set_at(document, tokens, item["value"])
         else:
-            raise InvalidResolution(
-                f"resolution for {pointer!r} needs 'choice' or 'value'"
-            )
+            # The up-front validation guarantees an explicit 'value'
+            # (null included); the missing-shape case is rejected there.
+            document = set_at(document, tokens, item["value"])
 
     remaining = [c for c in conflicts if c["pointer"] in open_conflicts]
     return document, remaining
@@ -443,8 +467,13 @@ def apply_resolutions(
 
     Raises StaleRevision (409) if expected_revision does not match the
     current revision, and AlreadyResolved (409) once the result is final.
-    A successful batch appends one audit event inside the same transaction
-    as the merge update; a rejected batch leaves neither.
+    Every item must give exactly one of 'choice' / 'value' (an explicit
+    null counts as 'value'); a mixed or empty item, like an unknown or
+    repeated pointer, rejects the whole batch with InvalidResolution
+    (400) — the shape of every item is checked before any item is
+    applied, so earlier legal items in the same batch are not written.
+    A successful batch appends one audit event inside the same
+    transaction as the merge update; a rejected batch leaves neither.
     """
     with db.transaction() as conn:
         row = _fetch_merge_row(conn, merge_id)
@@ -469,14 +498,16 @@ def preview_resolutions(
 ) -> dict:
     """Dry-run a resolution batch on an in-memory copy of the merge.
 
-    Same revision/status guards and per-item validation as
-    apply_resolutions, but stricter: an item carrying both 'choice' and
-    'value' is rejected. A batch that would resolve the last conflict is
-    also checked against the merge's result_schema with the same
-    validate_result call the commit path uses, so a candidate the real
-    submission would reject (422) fails the preview identically instead of
-    reporting a false would_resolve. Nothing is persisted — no write, no
-    revision bump, no status change.
+    Same revision/status guards and the exact same per-item validation
+    as apply_resolutions — including the choice/value exclusivity and
+    the 'value' required (an explicit null counts as given) checks,
+    which run inside _apply_batch before anything is applied. A batch
+    that would resolve the last conflict is also checked against the
+    merge's result_schema with the same validate_result call the commit
+    path uses, so a candidate the real submission would reject (422)
+    fails the preview identically instead of reporting a false
+    would_resolve. Nothing is persisted — no write, no revision bump, no
+    status change.
     """
     row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
     if row is None:
@@ -485,12 +516,6 @@ def preview_resolutions(
         raise AlreadyResolved(merge_id)
     if row["revision"] != expected_revision:
         raise StaleRevision(row["revision"])
-
-    for item in resolutions:
-        if item.get("choice") is not None and item.get("value_provided"):
-            raise InvalidResolution(
-                f"resolution for {item['pointer']!r} gives both 'choice' and 'value'"
-            )
 
     document, remaining = _apply_batch(
         json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
@@ -847,14 +872,10 @@ def update_draft(merge_id: str, draft_id: str, items: list[dict]) -> dict:
             pointer = item["pointer"]
             if pointer not in open_pointers:
                 raise UnknownConflictPointer(pointer)
-            if item.get("choice") is not None and item.get("value_provided"):
-                raise InvalidResolution(
-                    f"resolution for {pointer!r} gives both 'choice' and 'value'"
-                )
-            if item.get("choice") is None and not item.get("value_provided"):
-                raise InvalidResolution(
-                    f"resolution for {pointer!r} needs 'choice' or 'value'"
-                )
+            # Same choice/value shape check as the committing and
+            # preview resolution endpoints, so identical items are
+            # judged identically everywhere.
+            _validate_resolution_item(item)
 
         stored = json.loads(draft_row["resolutions"])
         for item in items:
