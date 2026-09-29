@@ -86,6 +86,152 @@ def test_batch_resolution_to_immutable_result(client):
     assert fetched["result"] == done["result"]
 
 
+def _two_conflict_merge(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a": 1, "b": 1},
+            "left": {"a": 2, "b": 2},
+            "right": {"a": 3, "b": 3},
+        },
+    )
+    assert resp.status_code == 201
+    return resp.json()
+
+
+def test_resolution_rejects_item_with_both_choice_and_value(client):
+    merge = _two_conflict_merge(client)
+    mid = merge["merge_id"]
+
+    # Choice plus a non-null value -> 400, same error as the preview.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 1,
+            "resolutions": [{"pointer": "/a", "choice": "left", "value": 9}],
+        },
+    )
+    assert resp.status_code == 400
+    assert "both 'choice' and 'value'" in resp.json()["detail"]
+
+    # An explicit null still counts as giving 'value'.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 1,
+            "resolutions": [{"pointer": "/a", "choice": "left", "value": None}],
+        },
+    )
+    assert resp.status_code == 400
+    assert "both 'choice' and 'value'" in resp.json()["detail"]
+
+    # Neither choice nor value -> 400 as well.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={"revision": 1, "resolutions": [{"pointer": "/a"}]},
+    )
+    assert resp.status_code == 400
+    assert "needs 'choice' or 'value'" in resp.json()["detail"]
+
+    # Nothing was applied: revision, status, conflicts, document and the
+    # audit trail all remain as created.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1
+    assert fetched["status"] == "pending"
+    assert [c["pointer"] for c in fetched["conflicts"]] == ["/a", "/b"]
+    assert fetched["document"] == {
+        "a": {"__merge_conflict__": "/a"},
+        "b": {"__merge_conflict__": "/b"},
+    }
+    assert fetched["result"] is None
+    audit = client.get(f"/merges/{mid}/audit").json()
+    assert audit["event_count"] == 0
+
+    # The merge is still resolvable with a well-formed batch at revision 1.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "choice": "left"},
+                {"pointer": "/b", "value": None},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result"] == {"a": 2, "b": None}
+
+
+def test_malformed_item_rejects_whole_batch_even_after_valid_item(client):
+    merge = _two_conflict_merge(client)
+    mid = merge["merge_id"]
+
+    # A legal item followed by a malformed one: no partial application.
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "choice": "left"},
+                {"pointer": "/b", "choice": "right", "value": 9},
+            ],
+        },
+    )
+    assert resp.status_code == 400
+    assert "both 'choice' and 'value'" in resp.json()["detail"]
+
+    # The legal first item must not have taken effect either.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["revision"] == 1
+    assert [c["pointer"] for c in fetched["conflicts"]] == ["/a", "/b"]
+    assert fetched["document"]["a"] == {"__merge_conflict__": "/a"}
+    assert client.get(f"/merges/{mid}/audit").json()["event_count"] == 0
+
+    # Same in the other order (malformed item first).
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 1,
+            "resolutions": [
+                {"pointer": "/a", "choice": "right", "value": 9},
+                {"pointer": "/b", "choice": "left"},
+            ],
+        },
+    )
+    assert resp.status_code == 400
+    assert client.get(f"/merges/{mid}").json()["revision"] == 1
+
+
+def test_commit_and_preview_judge_malformed_items_identically(client):
+    merge = _two_conflict_merge(client)
+    mid = merge["merge_id"]
+
+    malformed_batches = [
+        [{"pointer": "/a", "choice": "left", "value": 9}],
+        [{"pointer": "/a", "choice": "left", "value": None}],
+        [{"pointer": "/a"}],
+        [
+            {"pointer": "/a", "choice": "left"},
+            {"pointer": "/b", "choice": "right", "value": 9},
+        ],
+    ]
+    for resolutions in malformed_batches:
+        preview = client.post(
+            f"/merges/{mid}/resolution-preview",
+            json={"revision": 1, "resolutions": resolutions},
+        )
+        commit = client.post(
+            f"/merges/{mid}/resolutions",
+            json={"revision": 1, "resolutions": resolutions},
+        )
+        assert preview.status_code == commit.status_code == 400
+        assert preview.json()["detail"] == commit.json()["detail"]
+        # The rejected commit left the merge untouched.
+        fetched = client.get(f"/merges/{mid}").json()
+        assert fetched["revision"] == 1
+        assert [c["pointer"] for c in fetched["conflicts"]] == ["/a", "/b"]
+
+
 def test_stale_revision_returns_409(client):
     merge = create_merge(client)
     mid = merge["merge_id"]

@@ -334,8 +334,15 @@ def _resolution_items(body: ResolveRequest | DraftUpdateRequest) -> list[dict]:
 def resolve_merge(merge_id: str, body: ResolveRequest):
     """Submit a batch of conflict resolutions against the current revision.
 
-    Returns 409 on a stale revision or once the merge is resolved.
-    When the last conflict is resolved the result becomes immutable.
+    Each item must give exactly one adjudication: a ``choice``
+    (``"left"`` / ``"right"``) or an explicit ``value`` (a JSON null
+    counts as given). An item giving both or neither rejects the whole
+    batch with 400 — even when earlier items of the batch are valid, the
+    document, conflicts, result, revision and the audit trail all stay
+    unchanged. The same validation runs in the preview endpoint, so a
+    batch rejected by one is rejected identically by the other. Returns
+    409 on a stale revision or once the merge is resolved. When the last
+    conflict is resolved the result becomes immutable.
     """
     return store.apply_resolutions(merge_id, body.revision, _resolution_items(body))
 
@@ -346,13 +353,15 @@ def preview_resolution(merge_id: str, body: ResolveRequest):
 
     Same request shape as the committing endpoint, but the batch is
     validated and applied on an in-memory copy only: nothing is written,
-    the revision is not bumped and the status never changes. Returns the
-    would-be document and remaining conflicts; when the batch would
-    resolve everything, the candidate final document must pass the merge's
-    result_schema gate exactly as in the committing endpoint — a violation
-    yields the same 422 error list instead of a success preview — and only
-    then are the deterministic base-to-result patch and its SHA-256
-    included.
+    the revision is not bumped and the status never changes. Item
+    validation (exactly one of choice/value, known, non-duplicated
+    pointers) is the shared code path, so a 400 here matches a 400 on the
+    real submission for the same payload. Returns the would-be document
+    and remaining conflicts; when the batch would resolve everything, the
+    candidate final document must pass the merge's result_schema gate
+    exactly as in the committing endpoint — a violation yields the same
+    422 error list instead of a success preview — and only then are the
+    deterministic base-to-result patch and its SHA-256 included.
     """
     return store.preview_resolutions(merge_id, body.revision, _resolution_items(body))
 
